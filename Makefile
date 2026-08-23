@@ -53,15 +53,21 @@ uninstall:
 # exists, which is exactly how the SMART colouriser went missing once -- so
 # `check` is lint *and* test, and test actually runs every command.
 
+# The shellcheck branch is an if/else, not `command -v ... && shellcheck || echo`.
+# That form swallows a real finding: shellcheck exits non-zero, the `||` fires,
+# and lint reports "skip shellcheck not installed" while exiting 0.
 .PHONY: lint
 lint:
 	@zsh -n $(BIN) && echo "ok    $(BIN) parses"
 	@for h in $(HOOKS); do bash -n contrib/$$h && echo "ok    contrib/$$h parses"; done
 	@systemd-analyze verify contrib/systemd/*.service contrib/systemd/*.timer \
 	    && echo "ok    systemd units verify"
-	@command -v shellcheck >/dev/null 2>&1 \
-	    && shellcheck -S warning contrib/$(firstword $(HOOKS)) contrib/96-esp2-sync \
-	    || echo "skip  shellcheck not installed"
+	@if command -v shellcheck >/dev/null 2>&1; then \
+	    shellcheck -S warning $(addprefix contrib/,$(HOOKS)) \
+	        && echo "ok    hooks pass shellcheck"; \
+	else \
+	    echo "skip  shellcheck not installed"; \
+	fi
 
 .PHONY: test
 test:
