@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Nothing here needs an older run to finish; a newer push supersedes it.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# Job names are matched by string in branch protection. Renaming one without
+# updating the required checks leaves main waiting on a check that never
+# reports.
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Runners do not ship zsh, and `zsh -n` is most of what lint does.
+      - run: sudo apt-get update && sudo apt-get install -y zsh
+      # systemd-analyze warns that /usr/local/bin/btrkeeper is absent here --
+      # it is not installed in CI -- but still exits 0, so the units are
+      # genuinely verified.
+      - run: make lint
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y zsh
+      # The suite needs no btrfs, no root and no real disks: it shadows sudo
+      # with a fake on PATH and fakes the one findmnt probe that asserts the
+      # target is btrfs. Everything else -- lsblk, df, the real findmnt --
+      # answers honestly about a runner that has none of this hardware, which
+      # is a code path worth exercising in its own right.
+      #
+      # awk here is mawk, not the gawk on the development machine. That is
+      # deliberate: a gawk-ism in a colouriser should fail the build.
+      - run: make test
