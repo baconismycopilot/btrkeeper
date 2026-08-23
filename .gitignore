@@ -1,0 +1,15 @@
+# Nothing here is built, so this is mostly about what a working session
+# leaves behind rather than artifacts.
+
+*.bak
+*.orig
+*~
+*.swp
+
+# direnv sources this into every shell that enters the directory, so what it
+# holds is a per-machine concern and sometimes a private one. Never tracked.
+.envrc
+
+# Local Claude Code settings and its temp artifacts
+.claude/settings.local.json
+.claude/*.tmp.*

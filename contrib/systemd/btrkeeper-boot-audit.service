@@ -1,0 +1,9 @@
+[Unit]
+Description=Audit that every btrfs member disk can boot (btrkeeper)
+After=local-fs.target
+ConditionPathIsMountPoint=/
+
+[Service]
+Type=oneshot
+# Runs as root, so it compares ESP contents rather than only their sizes.
+ExecStart=/usr/local/bin/btrkeeper --raw boot

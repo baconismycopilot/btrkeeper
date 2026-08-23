@@ -1,0 +1,14 @@
+[Unit]
+Description=Monthly btrfs scrub (btrkeeper)
+
+[Timer]
+OnCalendar=monthly
+# Spread the start so a scrub never lands at exactly midnight on the 1st.
+RandomizedDelaySec=6h
+AccuracySec=1h
+# Desktops are not always on. Run a missed scrub after the next boot.
+Persistent=true
+Unit=btrkeeper-scrub.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# 95-esp-backup - mirror the EFI System Partition onto the btrfs array.
+#
+# On this system /boot IS the ESP, it is vfat, and it lives on one disk.
+# btrfs RAID1 protects the root filesystem but not this, so losing that disk
+# loses the bootloader, the kernel images and the initramfs together. Keeping
+# a current copy on the mirrored filesystem turns that from "reconstruct a
+# boot environment from a rescue USB" into "format an ESP and copy a folder".
+#
+# Limine runs the scripts in /etc/boot/hooks/post.d as root, after it has
+# finished updating the ESP, which is exactly when the copy should be taken.
+# Exit codes under 100 are reported as warnings by the hook runner, so a
+# failed backup warns loudly but never blocks a kernel install.
+
+set -uo pipefail
+
+readonly SCRIPT_NAME="esp-backup"
+readonly SRC=/boot
+readonly DEST=/var/lib/boot-backup
+
+warn() { printf '\033[93m%s: %s\033[0m\n' "$SCRIPT_NAME" "$*" >&2; }
+info() { printf '%s: %s\n' "$SCRIPT_NAME" "$*"; }
+
+((EUID == 0))          || { warn "must run as root";                exit 1; }
+mountpoint -q "$SRC"   || { warn "$SRC is not mounted; skipping";   exit 1; }
+[[ -d $DEST ]]         || { warn "$DEST does not exist; skipping";  exit 1; }
+
+# Never write the backup onto the ESP itself - that would protect nothing.
+if [[ "$(stat -c %d "$SRC")" == "$(stat -c %d "$DEST")" ]]; then
+    warn "$DEST is on the same filesystem as $SRC; refusing"
+    exit 1
+fi
+
+if ! rsync -a --delete --exclude=RESTORE-INFO.txt "$SRC/" "$DEST/"; then
+    warn "rsync failed; backup may be incomplete"
+    exit 1
+fi
+
+# Everything a future you needs, written down where the backup is, because
+# the machine that knows these values is the one that just died.
+{
+    printf 'Copy of %s taken %s\n\n'   "$SRC" "$(date -Is)"
+    printf 'ESP device : %s\n'         "$(findmnt -no SOURCE --target "$SRC")"
+    printf 'ESP UUID   : %s\n'         "$(findmnt -no UUID   --target "$SRC")"
+    printf 'root device: %s\n'         "$(findmnt -no SOURCE --target /)"
+    printf 'root UUID  : %s\n'         "$(findmnt -no UUID   --target /)"
+    printf 'cmdline    : %s\n\n'       "$(cat /proc/cmdline)"
+    cat <<'NOTE'
+Restore, from a rescue USB with the array mounted at /mnt:
+
+    sgdisk -n1:0:+4G -t1:EF00 /dev/<new-disk>     # if the ESP is gone too
+    mkfs.fat -F32 /dev/<new-esp>
+    mount /dev/<new-esp> /mnt/boot
+    cp -a /mnt/var/lib/boot-backup/. /mnt/boot/
+
+Then, in a chroot: update the /boot UUID in /etc/fstab to the new ESP,
+run limine-install, and add a firmware entry with efibootmgr --create.
+A degraded array also needs rootflags=degraded on the kernel cmdline.
+NOTE
+} > "$DEST/RESTORE-INFO.txt"
+
+sync
+info "ESP mirrored to $DEST ($(du -sh "$DEST" | cut -f1))"
+exit 0

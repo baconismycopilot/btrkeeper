@@ -1,0 +1,14 @@
+[Unit]
+Description=Weekly bootable-mirror audit (btrkeeper)
+
+[Timer]
+# Weekly rather than monthly: this catches a mirror ESP that stopped being
+# updated, and the window you care about is "since the last kernel update".
+OnCalendar=weekly
+RandomizedDelaySec=1h
+AccuracySec=1h
+Persistent=true
+Unit=btrkeeper-boot-audit.service
+
+[Install]
+WantedBy=timers.target

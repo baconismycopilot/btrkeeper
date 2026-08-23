@@ -1,0 +1,17 @@
+[Unit]
+Description=btrfs scrub (btrkeeper)
+Documentation=man:btrfs-scrub(8)
+After=local-fs.target
+ConditionPathIsMountPoint=/
+
+[Service]
+Type=oneshot
+# 'run' blocks and exits non-zero on errors, so this unit's status actually
+# reflects what the scrub found. 'start' would return success immediately.
+ExecStart=/usr/local/bin/btrkeeper --raw --yes scrub run
+# A scrub reads every allocated block. Yield to anything the user is doing.
+Nice=19
+IOSchedulingClass=idle
+CPUSchedulingPolicy=idle
+# Long by design: hours on a large array. Do not let systemd give up.
+TimeoutStartSec=infinity

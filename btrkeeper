@@ -1,0 +1,1439 @@
+#!/usr/bin/env zsh
+# btrkeeper — btrfs RAID1 maintenance helper
+# Usage: btrkeeper [options] <command> [args]   (btrkeeper help for details)
+
+set -euo pipefail
+
+# Locate a privileged helper. Distros disagree about bin vs sbin, so probe the
+# usual spots and let an explicit override win. Whatever this resolves to must
+# appear verbatim in your sudoers rule.
+resolve_bin() {
+    local name="$1" override="$2" p
+    if [[ -n "$override" ]]; then
+        print -- "$override"
+        return 0
+    fi
+    for p in "/usr/bin/$name" "/usr/sbin/$name" "/sbin/$name" "/bin/$name"; do
+        if [[ -x "$p" ]]; then
+            print -- "$p"
+            return 0
+        fi
+    done
+    print -- "/usr/bin/$name"   # not found; the error surfaces at call time
+    return 0
+}
+
+BTRFS_BIN="$(resolve_bin btrfs "${BTRKEEPER_BTRFS:-}")"
+SMARTCTL_BIN="$(resolve_bin smartctl "${BTRKEEPER_SMARTCTL:-}")"
+WIPEFS_BIN="$(resolve_bin wipefs "${BTRKEEPER_WIPEFS:-}")"
+
+MOUNT="${BTRKEEPER_MOUNT:-/}"
+ASSUME_YES=0
+WANT_HELP=0
+
+# Colour on by default, off when piped, when NO_COLOR is set, or with --raw.
+USE_COLOR=1
+[[ -n "${NO_COLOR:-}" ]] && USE_COLOR=0
+[[ -t 1 ]] || USE_COLOR=0
+C_RESET= C_BOLD= C_DIM= C_RED= C_ORANGE= C_YELLOW= C_GREEN=
+
+die() {
+    print -u2 -- "btrkeeper: $*"
+    exit 1
+}
+
+# Route privileged binaries through sudo; paths match the sudoers rules.
+btrfs()    { command sudo "$BTRFS_BIN" "$@" }
+smartctl() { command sudo "$SMARTCTL_BIN" "$@" }
+wipefs()   { command sudo "$WIPEFS_BIN" "$@" }
+
+confirm() {
+    local reply
+    if (( ASSUME_YES )); then
+        print -- "$1 [assumed yes]"
+        return 0
+    fi
+    print -n -- "$1 [y/N] "
+    read -q reply || { print; return 1 }
+    print
+}
+
+# Fail unless the target is inside a mounted btrfs filesystem.
+assert_btrfs() {
+    local fstype
+    fstype="$(findmnt -no FSTYPE --target "$MOUNT" 2>/dev/null | head -1)" || fstype=""
+    [[ "$fstype" == btrfs ]] || die "$MOUNT is not on a mounted btrfs filesystem"
+}
+
+# Resolve a device path through symlinks (/dev/disk/by-id/... -> /dev/sdX).
+# Missing paths are returned unchanged so callers can still report them.
+resolve_dev() {
+    local real
+    real="$(readlink -f -- "$1" 2>/dev/null)" || real=""
+    if [[ -n "$real" ]]; then
+        print -- "$real"
+    else
+        print -- "$1"
+    fi
+}
+
+# Print the block device paths belonging to the target filesystem.
+fs_devices() {
+    btrfs filesystem show "$MOUNT" | awk '/devid/ { print $NF }'
+}
+
+# Print the btrfs devid for a given device path, comparing resolved paths so
+# that /dev/disk/by-id/... names match the kernel names btrfs reports.
+devid_of() {
+    local want id devpath
+    want="$(resolve_dev "$1")"
+    btrfs filesystem show "$MOUNT" | awk '/devid/ { print $2, $NF }' \
+    | while read -r id devpath; do
+        if [[ "$(resolve_dev "$devpath")" == "$want" ]]; then
+            print -- "$id"
+        fi
+    done
+}
+
+# Print the device path recorded for a btrfs devid (empty if there is no such devid).
+path_of_devid() {
+    btrfs filesystem show "$MOUNT" | awk -v id="$1" '/devid/ && $2 == id { print $NF }'
+}
+
+# Print the btrfs-recorded size of a devid, in bytes (empty if unavailable).
+devid_size() {
+    local v
+    v="$(btrfs filesystem show --raw "$MOUNT" 2>/dev/null \
+        | awk -v id="$1" '/devid/ && $2 == id { print $4 }')" || v=""
+    if [[ "$v" == <-> ]]; then
+        print -- "$v"
+    fi
+    return 0
+}
+
+# Print the size of a block device, in bytes (empty if unavailable).
+dev_size() {
+    local v
+    v="$(lsblk -bdno SIZE -- "$1" 2>/dev/null | head -1)" || v=""
+    v="${v//[[:space:]]/}"
+    if [[ "$v" == <-> ]]; then
+        print -- "$v"
+    fi
+    return 0
+}
+
+# Byte count in human units, for prompts and error messages.
+fmt_bytes() {
+    numfmt --to=iec --suffix=B -- "$1" 2>/dev/null || print -- "$1 bytes"
+}
+
+# Human size of a block device / of a devid, or "?" when unknown.
+size_label() {
+    local v
+    v="$(dev_size "$1")"
+    if [[ -n "$v" ]]; then fmt_bytes "$v"; else print -- "?"; fi
+}
+
+devid_label() {
+    local v
+    v="$(devid_size "$1")"
+    if [[ -n "$v" ]]; then fmt_bytes "$v"; else print -- "?"; fi
+}
+
+# Refuse a replacement target that cannot hold the member it replaces. btrfs
+# would reject it too, but only after the prompt and the wipe-adjacent setup.
+assert_fits() {
+    local id="$1" new="$2" need have
+    need="$(devid_size "$id")"
+    have="$(dev_size "$new")"
+    if [[ -z "$need" || -z "$have" ]]; then
+        print -u2 -- "btrkeeper: warning: cannot compare sizes for $new; leaving it to btrfs"
+        return 0
+    fi
+    if (( have < need )); then
+        die "$new is $(fmt_bytes "$have") but devid $id needs at least $(fmt_bytes "$need")"
+    fi
+    return 0
+}
+
+# Resolve a member given as a device path or a bare devid, so that a drive
+# which has already vanished can still be named. Prints "<devid> <path>";
+# the path may no longer exist.
+member_ref() {
+    local want="$1" id devpath
+    if [[ "$want" == <-> ]]; then
+        id="$want"
+        devpath="$(path_of_devid "$id")"
+        [[ -n "$devpath" ]] || die "no devid $id in $MOUNT (see 'btrkeeper status')"
+    else
+        id="$(devid_of "$want")"
+        [[ -n "$id" ]] \
+            || die "$want is not a member of $MOUNT (see 'btrkeeper status' for devids)"
+        devpath="$(resolve_dev "$want")"
+    fi
+    print -- "$id $devpath"
+}
+
+# Print the parent disk for a device path (partition -> disk, disk -> itself).
+parent_disk() {
+    local parent
+    parent="$(lsblk -no PKNAME -- "$1" 2>/dev/null | head -1)" || parent=""
+    parent="${parent//[[:space:]]/}"
+    if [[ -n "$parent" ]]; then
+        print -- "/dev/$parent"
+    else
+        print -- "$1"
+    fi
+}
+
+# Print the first mountpoint of a device or any of its partitions (empty if none).
+dev_mountpoint() {
+    local kid out kids
+    kids="$(lsblk -rno PATH -- "$1" 2>/dev/null)" || kids=""
+    for kid in ${(f)kids}; do
+        out="$(findmnt -rno TARGET -S "$kid" 2>/dev/null | head -1)" || out=""
+        if [[ -n "$out" ]]; then
+            print -- "$out"
+            return 0
+        fi
+    done
+    return 0
+}
+
+# Show what a device is, so the confirmation prompt names something recognisable.
+describe_dev() {
+    lsblk -o NAME,SIZE,TYPE,FSTYPE,LABEL,MOUNTPOINTS -- "$1" 2>/dev/null \
+        || lsblk -o NAME,SIZE,TYPE,FSTYPE,LABEL,MOUNTPOINT -- "$1" 2>/dev/null \
+        || true
+}
+
+# The EFI System Partition on a disk, if it has one.
+esp_on() {
+    local out
+    # lsblk exits non-zero on a device it does not know, and pipefail would
+    # otherwise propagate that out of the command substitution and take the
+    # whole run down. A disk we cannot inspect simply has no ESP.
+    out="$(lsblk -rno PATH,PARTTYPE -- "$1" 2>/dev/null \
+        | awk '$2 == "c12a7328-f81f-11d2-ba4b-00a0c93ec93b" { print $1; exit }')" || out=""
+    print -r -- "$out"
+    return 0
+}
+
+# A btrfs mirror only makes the system redundant if you can boot from either
+# half. If the array boots from an ESP and an incoming drive has none, say so
+# before the drive is consumed: once it is a whole-disk member there is no
+# room left to add one without rebuilding the array.
+warn_no_esp() {
+    local dev disk existing="" new found
+    for dev in $(fs_devices); do
+        disk="$(parent_disk "$dev")"
+        found="$(esp_on "$disk")"
+        [[ -n "$found" ]] && existing="$found"
+    done
+    [[ -n "$existing" ]] || return 0
+
+    for new in "$@"; do
+        if [[ -z "$(esp_on "$(parent_disk "$new")")" ]]; then
+            print -r -- "${C_ORANGE}warning: this array boots from $existing, and $new carries no EFI"
+            print -r -- "         System Partition. RAID1 keeps your data if that disk dies, but"
+            print -r -- "         the machine will not boot from this one."
+            print -r -- "         For a bootable mirror, partition the drive first (ESP + btrfs)"
+            print -r -- "         and hand btrkeeper the btrfs partition instead of the whole"
+            print -r -- "         disk. See 'btrkeeper help boot'.${C_RESET}"
+            print
+            return 0
+        fi
+    done
+    return 0
+}
+
+# Refuse a device that is already in the array, mounted, or claimed by
+# md/LUKS/LVM. This is the guard between a mistyped device name and a wiped
+# system disk, so it runs before any confirmation prompt.
+assert_free_device() {
+    local dev="$1" verb="$2" real member mp holder
+    real="$(resolve_dev "$dev")"
+    [[ -b "$real" ]] || die "$verb requires a block device path (got '$dev')"
+
+    for member in $(fs_devices); do
+        if [[ "$(resolve_dev "$member")" == "$real" ]]; then
+            die "$dev is already a member of $MOUNT"
+        fi
+    done
+
+    mp="$(dev_mountpoint "$real")"
+    if [[ -n "$mp" ]]; then
+        die "$dev (or a partition on it) is mounted at $mp — unmount it first"
+    fi
+
+    holder="$(lsblk -rno NAME,TYPE -- "$real" 2>/dev/null \
+        | awk '$2 ~ /raid|crypt|lvm/ { print $1; exit }')" || holder=""
+    if [[ -n "$holder" ]]; then
+        die "$dev is claimed by $holder (md/LUKS/LVM) — release it first"
+    fi
+
+    return 0
+}
+
+# Populate the palette. Set empty when colour is off, so the same code paths
+# and the same awk programs serve both modes.
+setup_colors() {
+    if (( USE_COLOR )); then
+        C_RESET=$'\e[0m'
+        C_BOLD=$'\e[1m'
+        C_DIM=$'\e[2m'
+        C_RED=$'\e[1;31m'
+        C_ORANGE=$'\e[38;5;208m'
+        C_YELLOW=$'\e[33m'
+        C_GREEN=$'\e[32m'
+    fi
+    return 0
+}
+
+section() {
+    print -r -- "${C_BOLD}== $1 ==${C_RESET}"
+}
+
+# 'btrfs filesystem show': a missing device is the thing you must not scroll
+# past, so it is the only red here.
+color_fs_show() {
+    awk -v red="$C_RED" -v grn="$C_GREEN" -v ylw="$C_YELLOW" -v rst="$C_RESET" '
+        tolower($0) ~ /missing/ { print red $0 rst; next }
+        /^Label/                { print ylw $0 rst; next }
+        /Total devices/         { print ylw $0 rst; next }
+        /devid/ {
+            p = $NF
+            print substr($0, 1, length($0) - length(p)) grn p rst
+            next
+        }
+        { print }
+    '
+}
+
+# 'btrfs filesystem usage'. Two different questions live in this output and
+# they grade in opposite directions:
+#
+#   "am I running out of room"  -> Device allocated / Device size, and the
+#                                  unallocated headroom left to carve chunks
+#                                  from. High allocation is the bad end.
+#   "are my chunks well packed" -> the (NN.NN%) on a Data/Metadata profile
+#                                  line. That is Used/Size *within already
+#                                  allocated chunks*, so LOW is the bad end:
+#                                  it means allocation is spread across
+#                                  half-empty chunks, which is what
+#                                  'balance quick' (-dusage=50) compacts.
+#
+# Grading the second one as if it were the first is backwards, and makes a
+# healthy densely-packed array look alarming.
+color_fs_usage() {
+    awk -v red="$C_RED" -v org="$C_ORANGE" -v ylw="$C_YELLOW" \
+        -v grn="$C_GREEN" -v rst="$C_RESET" '
+        function fullcol(p) {                       # allocation pressure
+            if (p >= 95) return red
+            if (p >= 85) return org
+            if (p >= 70) return ylw
+            return grn
+        }
+        function headcol(p) {                       # headroom left; inverted
+            if (p < 5)  return red
+            if (p < 15) return org
+            if (p < 30) return ylw
+            return grn
+        }
+        function packcol(p) {                       # chunk packing; inverted
+            if (p < 50) return org                  # what balance quick targets
+            if (p < 75) return ylw
+            return grn
+        }
+        function tobytes(s,   n, u) {
+            if (!match(s, /^[0-9.]+/)) return -1
+            n = substr(s, RSTART, RLENGTH) + 0
+            u = substr(s, RSTART + RLENGTH)
+            if (u ~ /^KiB/) return n * 1024
+            if (u ~ /^MiB/) return n * 1024 * 1024
+            if (u ~ /^GiB/) return n * 1024 * 1024 * 1024
+            if (u ~ /^TiB/) return n * 1024 * 1024 * 1024 * 1024
+            if (u ~ /^PiB/) return n * 1024 * 1024 * 1024 * 1024 * 1024
+            if (u ~ /^B/)   return n
+            return -1
+        }
+        function paintlast(s, c) {
+            return substr(s, 1, length(s) - length($NF)) c $NF rst
+        }
+        function paint_pack(s,   p, c, out) {
+            if (!match(s, /\([0-9]+\.[0-9]+%\)/)) return s
+            p = substr(s, RSTART + 1, RLENGTH - 3) + 0
+            c = packcol(p)
+            out = substr(s, 1, RSTART - 1) c substr(s, RSTART, RLENGTH) rst \
+                  substr(s, RSTART + RLENGTH)
+            if (c == org) out = out "  " org "<- sparse; try '"'"'balance quick'"'"'" rst
+            return out
+        }
+
+        /Device size:/ { devsize = tobytes($NF); print; next }
+
+        /Device allocated:/ {
+            v = tobytes($NF)
+            if (devsize > 0 && v >= 0) {
+                p = v * 100 / devsize
+                printf "%s %s(%.0f%% of raw capacity allocated)%s\n", \
+                       paintlast($0, fullcol(p)), fullcol(p), p, rst
+            } else print
+            next
+        }
+
+        /Device unallocated:/ {
+            v = tobytes($NF)
+            if (devsize > 0 && v >= 0) {
+                p = v * 100 / devsize
+                printf "%s %s(%.0f%% left to allocate from)%s\n", \
+                       paintlast($0, headcol(p)), headcol(p), p, rst
+            } else print
+            next
+        }
+
+        /Device missing:/    { print ($NF == "0.00B" ? grn : red) $0 rst; next }
+        /Multiple profiles:/ { print ($NF == "no"    ? grn : org) $0 rst; next }
+
+        /^(Data|Metadata|System|GlobalReserve),/ {
+            n = index($0, ":")
+            prof = substr($0, 1, n - 1)
+            rest = substr($0, n)
+            if (prof ~ /^GlobalReserve/) c = ylw       # always single; not a fault
+            else if (prof ~ /RAID1/)     c = grn
+            else if (prof ~ /RAID0/)     c = red       # no redundancy at all
+            else                         c = org       # single or DUP: unmirrored
+            # System and GlobalReserve chunks are tiny and always look sparse;
+            # grading their packing would be pure noise.
+            if (prof ~ /^(Data|Metadata)/) rest = paint_pack(rest)
+            print c prof rst rest
+            next
+        }
+
+        { print }
+    '
+}
+
+# The SMART overall-health verdict: one line, and the only thing on it that
+# matters is the last word.
+color_smart_health() {
+    awk -v red="$C_RED" -v grn="$C_GREEN" -v ylw="$C_YELLOW" -v rst="$C_RESET" '
+        /PASSED|OK$/          { print grn $0 rst; next }
+        /FAILED|FAILING|NOT/  { print red $0 rst; next }
+        { print ylw $0 rst }
+    '
+}
+
+# SMART attributes, in both dialects: NVMe "Name: value" lines and the SATA
+# attribute table. Either way the interesting number is graded and the rest of
+# the line is left alone.
+color_smart_attrs() {
+    awk -v red="$C_RED" -v org="$C_ORANGE" -v ylw="$C_YELLOW" \
+        -v grn="$C_GREEN" -v rst="$C_RESET" '
+        function wearcol(p)  { if (p>=95) return red; if (p>=85) return org
+                               if (p>=70) return ylw; return grn }
+        function sparecol(p) { if (p<10)  return red; if (p<20)  return org
+                               if (p<50)  return ylw; return grn }
+        function tempcol(t)  { if (t>=70) return red; if (t>=60) return org
+                               if (t>=50) return ylw; return grn }
+        # Byte offset at which field k starts, so a value can be painted
+        # without disturbing smartctl column alignment.
+        function field_at(s, k,   i, pos) {
+            pos = 1
+            for (i = 1; i < k; i++) {
+                while (substr(s, pos, 1) == " ") pos++
+                while (pos <= length(s) && substr(s, pos, 1) != " ") pos++
+            }
+            while (substr(s, pos, 1) == " ") pos++
+            return pos
+        }
+        function firstnum(s,   v) {
+            if (match(s, /[0-9][0-9,]*/)) {
+                v = substr(s, RSTART, RLENGTH)
+                gsub(/,/, "", v)
+                return v + 0
+            }
+            return -1
+        }
+        function paintnum(s, c) {
+            if (match(s, /[0-9][0-9,]*/))
+                return substr(s, 1, RSTART - 1) c substr(s, RSTART, RLENGTH) rst \
+                       substr(s, RSTART + RLENGTH)
+            return s
+        }
+        {
+            l = tolower($0)
+
+            # SATA attribute table: ID# ATTRIBUTE_NAME ... WHEN_FAILED RAW_VALUE
+            if ($1 ~ /^[0-9]+$/ && NF >= 10) {
+                pos  = field_at($0, 10)
+                head = substr($0, 1, pos - 1)
+                tail = substr($0, pos)
+                raw  = firstnum(tail)
+                if ($9 != "-" && $9 != "")            c = red
+                else if (l ~ /reallocated|current_pending|offline_uncorrectable/)
+                                                      c = (raw > 0) ? red : grn
+                else if (l ~ /crc_error/)             c = (raw > 0) ? org : grn
+                else if (l ~ /temperature/)           c = tempcol(raw)
+                else if (l ~ /wear_leveling|ssd_life/) c = wearcol(100 - $4)
+                else                                  c = ylw
+                print head paintnum(tail, c)
+                next
+            }
+
+            # NVMe "Name: value"
+            n = index($0, ":")
+            if (n > 0) {
+                name = tolower(substr($0, 1, n - 1))
+                tail = substr($0, n + 1)
+                v    = firstnum(tail)
+                if (name ~ /available spare threshold/)      c = ylw
+                else if (name ~ /available spare/)           c = sparecol(v)
+                else if (name ~ /percentage used/)           c = wearcol(v)
+                else if (name ~ /media and data integrity/)  c = (v > 0) ? red : grn
+                else if (name ~ /error information log/)     c = (v > 0) ? ylw : grn
+                else if (name ~ /temperature/)               c = tempcol(v)
+                else                                         c = ylw
+                print substr($0, 1, n) paintnum(tail, c)
+                next
+            }
+            print
+        }
+    '
+}
+
+# 'btrfs device stats': any non-zero counter is red, zero is green. These are
+# the numbers people miss in a wall of text.
+color_dev_stats() {
+    awk -v red="$C_RED" -v grn="$C_GREEN" -v rst="$C_RESET" '
+        {
+            n = $NF
+            if (n ~ /^[0-9]+$/) {
+                c = (n + 0 > 0) ? red : grn
+                print substr($0, 1, length($0) - length(n)) c n rst
+            } else {
+                print
+            }
+        }
+    '
+}
+
+# The PARTUUID of a partition. Firmware boot entries name partitions by GUID,
+# not by path, and bootnums are volatile - some firmwares renumber their BBS
+# entries on every boot - so the GUID is the only stable way to match them up.
+partuuid_of() {
+    local v
+    v="$(lsblk -rno PARTUUID -- "$1" 2>/dev/null | head -1)" || v=""
+    print -r -- "${v//[[:space:]]/}"
+    return 0
+}
+
+# Firmware boot entries referencing a partition GUID, as "<bootnum>\t<label>".
+efi_entries_for() {
+    local guid="${1:l}" out
+    [[ -n "$guid" ]] || return 0
+    out="$(efibootmgr 2>/dev/null | awk -v g="$guid" '
+        /^Boot[0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f]/ {
+            tab = index($0, "\t")
+            if (tab == 0) next
+            head = substr($0, 1, tab - 1)
+            if (tolower($0) !~ g) next
+            sp = index(head, " ")
+            print substr(head, 5, 4) "\t" substr(head, sp + 1)
+        }')" || out=""
+    print -r -- "$out"
+    return 0
+}
+
+# 1-based position of a bootnum within BootOrder, empty if absent.
+boot_order_pos() {
+    local num="${1:l}" order e i=1
+    order="$(efibootmgr 2>/dev/null | awk -F': ' '/^BootOrder:/ { print $2 }')" || order=""
+    for e in ${(s:,:)order}; do
+        if [[ "${e:l}" == "$num" ]]; then
+            print -r -- "$i"
+            return 0
+        fi
+        i=$(( i + 1 ))
+    done
+    return 0
+}
+
+# Where a block device is mounted, empty if it is not.
+mount_of() {
+    local v
+    v="$(findmnt -no TARGET -S "$1" 2>/dev/null | head -1)" || v=""
+    print -r -- "$v"
+    return 0
+}
+
+# Bytes in use on a mounted filesystem. statfs needs no read access, so this
+# works unprivileged even on an ESP mounted umask=0077.
+used_of() {
+    local v
+    v="$(df -B1 --output=used "$1" 2>/dev/null | tail -1)" || v=""
+    print -r -- "${v//[[:space:]]/}"
+    return 0
+}
+
+# Show filesystem layout, allocation, and per-device error counters.
+cmd_status() {
+    assert_btrfs
+    section "Devices"
+    btrfs filesystem show "$MOUNT" | color_fs_show
+    print
+    section "Allocation"
+    btrfs filesystem usage "$MOUNT" | color_fs_usage
+    print
+    section "Error counters"
+    btrfs device stats "$MOUNT" | color_dev_stats
+}
+
+# Show SMART wear and error indicators for every member disk. The attribute
+# filter covers both NVMe wear counters and the SATA attributes that actually
+# predict failure.
+cmd_health() {
+    assert_btrfs
+    local dev disk attrs verdict
+    # One pattern, no embedded newlines: grep would treat those as separate
+    # patterns, and a trailing '|' as an empty alternative matching everything.
+    attrs='percentage used|available spare|media and data|error information'
+    attrs+='|reallocated|current_pending|offline_uncorrectable|udma_crc'
+    attrs+='|wear_leveling|ssd_life|temperature|power.on'
+    for dev in $(fs_devices); do
+        disk="$(parent_disk "$dev")"
+        section "$disk (member: $dev)"
+        verdict="$(smartctl -H "$disk" 2>/dev/null | grep -Ei 'result|health status' || true)"
+        if [[ -n "$verdict" ]]; then
+            print -r -- "$verdict" | color_smart_health
+        else
+            print -r -- "${C_ORANGE}no SMART data for $disk${C_RESET}"
+        fi
+        smartctl -A "$disk" 2>/dev/null | grep -Ei "$attrs" | color_smart_attrs || true
+        print
+    done
+    section "Error counters"
+    btrfs device stats "$MOUNT" | color_dev_stats
+}
+
+# Start, check, or cancel a checksum scrub.
+cmd_scrub() {
+    assert_btrfs
+    local action="${1:-status}"
+    case "$action" in
+        start)  btrfs scrub start "$MOUNT" ;;
+        run)    btrfs scrub start -B "$MOUNT" ;;
+        status) btrfs scrub status "$MOUNT" ;;
+        cancel) btrfs scrub cancel "$MOUNT" ;;
+        *)      die "scrub takes: start | run | status | cancel" ;;
+    esac
+}
+
+# Start, check, or cancel a balance; quick mode only compacts sparse chunks.
+cmd_balance() {
+    assert_btrfs
+    local action="${1:-status}"
+    case "$action" in
+        full)   btrfs balance start "$MOUNT" ;;
+        quick)  btrfs balance start -dusage=50 -musage=50 "$MOUNT" ;;
+        status) btrfs balance status "$MOUNT" ;;
+        cancel) btrfs balance cancel "$MOUNT" ;;
+        *)      die "balance takes: full | quick | status | cancel" ;;
+    esac
+}
+
+# Convert data and metadata profiles. RAID1 is what this tool exists for;
+# single is the escape hatch for freeing a device, and the only thing here
+# that deliberately removes redundancy - so it says so before it does it.
+cmd_convert() {
+    assert_btrfs
+    local target="${1:-raid1}"
+    local -a members
+    members=($(fs_devices))
+
+    case "$target" in
+        raid1)
+            (( ${#members} >= 2 )) \
+                || die "RAID1 needs 2 devices; $MOUNT has ${#members} (add one with 'btrkeeper add')"
+            confirm "Convert data+metadata on $MOUNT to RAID1? This rewrites all chunks." \
+                || die "aborted"
+            btrfs balance start -dconvert=raid1 -mconvert=raid1 "$MOUNT"
+            ;;
+        single)
+            print -r -- "${C_ORANGE}This removes redundancy from $MOUNT.${C_RESET}"
+            print -r -- "  data     -> single, one copy only: a bad sector becomes data loss"
+            print -r -- "  metadata -> DUP, still two copies, but both on the same device"
+            print
+            print -r -- "Intended as the step before freeing a device with 'btrkeeper remove'."
+            print -r -- "Scrub first if you have not: you are about to depend on copies you"
+            print -r -- "have not verified."
+            print
+            confirm "Convert data+metadata on $MOUNT to single/DUP?" || die "aborted"
+            btrfs balance start -dconvert=single -mconvert=dup "$MOUNT"
+            ;;
+        *)  die "convert takes: raid1 | single" ;;
+    esac
+}
+
+# Wipe a new device and add it to the filesystem.
+cmd_add() {
+    assert_btrfs
+    local dev="${1:-}" real
+    [[ -n "$dev" ]] || die "add requires a block device path"
+    assert_free_device "$dev" add
+    real="$(resolve_dev "$dev")"
+
+    print -- "About to wipe and add:"
+    describe_dev "$real"
+    print -- "Signatures currently on $real:"
+    wipefs -n -- "$real" || true
+    print
+    warn_no_esp "$real"
+    confirm "Wipe $real and add it to $MOUNT?" || die "aborted"
+
+    wipefs -a -- "$real"
+    btrfs device add "$real" "$MOUNT"
+    print -- "Added. Run 'btrkeeper convert' if this should become a RAID1 mirror."
+}
+
+# Migrate data off a device and detach it from the filesystem.
+cmd_remove() {
+    assert_btrfs
+    local dev="${1:-}" ref id devpath
+    [[ -n "$dev" ]] || die "remove requires a block device path or devid"
+    ref="$(member_ref "$dev")"
+    id="${ref%% *}"
+    devpath="${ref#* }"
+    confirm "Remove devid $id ($devpath) from $MOUNT? Data will migrate to remaining devices." \
+        || die "aborted"
+    if [[ -b "$devpath" ]]; then
+        btrfs device remove "$devpath" "$MOUNT"
+    else
+        print -- "note: $devpath is not present; removing by devid $id"
+        btrfs device remove "$id" "$MOUNT"
+    fi
+}
+
+# Replace one member device with a new one and grow into its full size. The
+# old member may be named by devid, so a drive that is already gone can still
+# be replaced (mount the filesystem -o degraded first).
+cmd_replace() {
+    assert_btrfs
+    local old="${1:-}" new="${2:-}" ref id devpath
+    [[ -n "$old" && -n "$new" ]] || die "replace requires <old-dev|devid> <new-dev>"
+
+    ref="$(member_ref "$old")"
+    id="${ref%% *}"
+    devpath="${ref#* }"
+    assert_free_device "$new" replace
+    assert_fits "$id" "$new"
+
+    print -- "About to replace devid $id ($devpath, $(devid_label "$id")) with:"
+    describe_dev "$new"
+    print
+    warn_no_esp "$new"
+    confirm "Proceed? $new will be wiped." || die "aborted"
+
+    if [[ -b "$devpath" ]]; then
+        btrfs replace start -B -f "$devpath" "$new" "$MOUNT"
+    else
+        print -- ">> $devpath is not present; replacing by devid $id"
+        btrfs replace start -B -f "$id" "$new" "$MOUNT"
+    fi
+    btrfs filesystem resize "$id:max" "$MOUNT"
+    print -- "Replaced and resized. Run 'btrkeeper scrub start' to verify mirrors."
+}
+
+# Replace both members with larger drives, one at a time, scrubbing in between.
+cmd_upgrade() {
+    assert_btrfs
+    local new_a="${1:-}" new_b="${2:-}" ra rb
+    [[ -n "$new_a" && -n "$new_b" ]] || die "upgrade requires <new-dev-1> <new-dev-2>"
+
+    ra="$(resolve_dev "$new_a")"
+    rb="$(resolve_dev "$new_b")"
+    [[ "$ra" != "$rb" ]] || die "upgrade needs two distinct devices (both are $ra)"
+    assert_free_device "$new_a" upgrade
+    assert_free_device "$new_b" upgrade
+
+    local -a members
+    members=($(fs_devices))
+    (( ${#members} == 2 )) || die "expected exactly 2 members, found ${#members}"
+
+    local id_a id_b
+    id_a="$(devid_of "${members[1]}")"
+    id_b="$(devid_of "${members[2]}")"
+    [[ -n "$id_a" && -n "$id_b" ]] || die "could not resolve member devids for $MOUNT"
+    assert_fits "$id_a" "$ra"
+    assert_fits "$id_b" "$rb"
+
+    print -- "Plan:"
+    print -- "  1. ${members[1]} ($(devid_label "$id_a")) -> $ra ($(size_label "$ra"))"
+    print -- "  2. Verification scrub  (blocks until the new mirror is proven)"
+    print -- "  3. ${members[2]} ($(devid_label "$id_b")) -> $rb ($(size_label "$rb"))"
+    print -- "  4. Final scrub to verify both mirrors"
+    print
+    print -- "Step 2 can take hours, and it is not optional: replacing both"
+    print -- "members without it means a latent bad block on ${members[2]} would"
+    print -- "become unrecoverable once ${members[1]} is gone."
+    print
+    warn_no_esp "$ra" "$rb"
+    confirm "Proceed? Both new drives will be wiped." || die "aborted"
+
+    local old new id first=1
+    local -a pairs
+    pairs=("${members[1]}" "$ra" "${members[2]}" "$rb")
+    for old new in "${pairs[@]}"; do
+        id="$(devid_of "$old")"
+        [[ -n "$id" ]] || die "$old is no longer a member of $MOUNT"
+        print -- ">> Replacing $old (devid $id) with $new"
+        btrfs replace start -B -f "$old" "$new" "$MOUNT"
+        btrfs filesystem resize "$id:max" "$MOUNT"
+        if (( first )); then
+            print -- ">> Verifying the rebuilt mirror before touching the second drive"
+            if ! btrfs scrub start -B "$MOUNT"; then
+                die "scrub reported errors — stopping before the second replace. Investigate with 'btrkeeper status'."
+            fi
+            first=0
+        fi
+    done
+
+    print -- ">> Starting final verification scrub"
+    btrfs scrub start "$MOUNT"
+    print -- "Upgrade complete. Check progress with 'btrkeeper scrub status'."
+}
+
+# Audit whether the array is bootable from every member, not merely
+# redundant. Read-only: it never writes a partition table, an ESP or a
+# firmware variable, because none of those are btrfs operations.
+cmd_boot() {
+    assert_btrfs
+    local dev disk esp guid ents num label pos mp
+    local -a esp_list
+    local total=0 with_esp=0 problems=0 warnings=0
+
+    section "Member disks"
+    for dev in $(fs_devices); do
+        disk="$(parent_disk "$dev")"
+        esp="$(esp_on "$disk")"
+        total=$(( total + 1 ))
+        if [[ -n "$esp" ]]; then
+            with_esp=$(( with_esp + 1 ))
+            esp_list+=("$esp")
+            print -r -- "  ${C_GREEN}ok${C_RESET}   $disk  (member $dev)  ESP $esp"
+        else
+            problems=$(( problems + 1 ))
+            print -r -- "  ${C_RED}BAD${C_RESET}  $disk  (member $dev)  ${C_RED}no ESP: this disk cannot boot the system${C_RESET}"
+        fi
+    done
+    print
+
+    section "Firmware boot entries"
+    if [[ ! -d /sys/firmware/efi ]]; then
+        print -r -- "  ${C_YELLOW}not an EFI system; nothing to check${C_RESET}"
+    elif ! command -v efibootmgr >/dev/null 2>&1; then
+        print -r -- "  ${C_YELLOW}efibootmgr not installed; cannot read boot entries${C_RESET}"
+        warnings=$(( warnings + 1 ))
+    else
+        for esp in "${esp_list[@]}"; do
+            guid="$(partuuid_of "$esp")"
+            ents="$(efi_entries_for "$guid")"
+            if [[ -z "$ents" ]]; then
+                warnings=$(( warnings + 1 ))
+                print -r -- "  ${C_ORANGE}warn${C_RESET} $esp  ${C_ORANGE}no firmware entry points at this ESP${C_RESET}"
+                continue
+            fi
+            print -r -- "  $esp"
+            while IFS=$'\t' read -r num label; do
+                [[ -n "$num" ]] || continue
+                pos="$(boot_order_pos "$num")"
+                if [[ -n "$pos" ]]; then
+                    print -r -- "         ${C_GREEN}Boot$num${C_RESET}  $label  ${C_DIM}(BootOrder #$pos)${C_RESET}"
+                else
+                    warnings=$(( warnings + 1 ))
+                    print -r -- "         ${C_ORANGE}Boot$num${C_RESET}  $label  ${C_ORANGE}(not in BootOrder)${C_RESET}"
+                fi
+            done <<< "$ents"
+        done
+    fi
+    print
+
+    section "ESP contents"
+    local -a mounted
+    for esp in "${esp_list[@]}"; do
+        mp="$(mount_of "$esp")"
+        if [[ -z "$mp" ]]; then
+            warnings=$(( warnings + 1 ))
+            print -r -- "  ${C_YELLOW}warn${C_RESET} $esp  ${C_YELLOW}not mounted; cannot compare contents${C_RESET}"
+        else
+            mounted+=("$mp")
+            print -r -- "  ${C_GREEN}ok${C_RESET}   $esp  mounted $mp  ($(fmt_bytes "$(used_of "$mp")") used)"
+        fi
+    done
+
+    # A stale mirror ESP is the failure that hides: everything looks fine
+    # until the day the live ESP is gone and the copy is a year behind.
+    if (( ${#mounted} >= 2 )); then
+        local a="${mounted[1]}" b
+        for b in "${mounted[@]:1}"; do
+            if (( EUID == 0 )); then
+                if diff -rq "$a" "$b" >/dev/null 2>&1; then
+                    print -r -- "  ${C_GREEN}ok${C_RESET}   $b is identical to $a"
+                else
+                    problems=$(( problems + 1 ))
+                    print -r -- "  ${C_RED}BAD${C_RESET}  ${C_RED}$b differs from $a: the mirror ESP is stale${C_RESET}"
+                    print -r -- "         compare with: sudo diff -rq $a $b"
+                fi
+            elif [[ "$(used_of "$a")" == "$(used_of "$b")" ]]; then
+                print -r -- "  ${C_YELLOW}note${C_RESET} $b matches $a in size; run as root to compare contents"
+            else
+                warnings=$(( warnings + 1 ))
+                print -r -- "  ${C_ORANGE}warn${C_RESET} ${C_ORANGE}$b differs from $a in size; likely stale${C_RESET}"
+                print -r -- "         compare with: sudo diff -rq $a $b"
+            fi
+        done
+    fi
+    print
+
+    section "Summary"
+    if (( total < 2 )); then
+        print -r -- "  ${C_YELLOW}single-device filesystem; there is no mirror to boot from${C_RESET}"
+    fi
+    print -r -- "  $with_esp of $total member disks carry an ESP"
+    if (( problems > 0 )); then
+        print -r -- "  ${C_RED}$problems problem(s): this array is not bootable from every member${C_RESET}"
+        return 1
+    elif (( warnings > 0 )); then
+        print -r -- "  ${C_ORANGE}$warnings warning(s): bootable, but check the notes above${C_RESET}"
+        return 0
+    fi
+    print -r -- "  ${C_GREEN}every member disk can boot this system${C_RESET}"
+    return 0
+}
+
+# Reset per-device error counters after investigating them.
+cmd_stats_reset() {
+    assert_btrfs
+    confirm "Zero all device error counters on $MOUNT?" || die "aborted"
+    btrfs device stats -z "$MOUNT"
+}
+
+# Root help is an index; per-command detail lives in 'btrkeeper help <topic>'
+# so that the notes relevant to a command sit next to that command.
+help_root() {
+    cat <<'EOF'
+btrkeeper - btrfs RAID1 maintenance
+
+Usage: btrkeeper [options] <command> [args]
+
+Options:
+  -m, --mount PATH   Filesystem to operate on (default: /, or $BTRKEEPER_MOUNT)
+  -y, --yes          Assume yes; skip confirmation prompts (for cron/systemd)
+  -h, --help         Help; after a command, help for that command
+      --raw          Plain output, no colour (see 'btrkeeper help status')
+
+Commands:
+  status                     Filesystem layout, usage, and error counters
+  health                     SMART wear/errors per disk + btrfs counters
+  scrub   start|run|status|cancel
+                             Verify checksums, repair from good mirror
+  balance full|quick|status|cancel
+                             Rewrite chunks to reclaim allocation
+  convert raid1|single       Convert profiles; single frees a device
+  add     <dev>              Wipe a drive and add it to the pool
+  remove  <dev|devid>        Migrate data off a drive and detach it
+  replace <old|devid> <new>  Swap one member for a new drive, resize to max
+  upgrade <new1> <new2>      Swap both members for bigger drives
+  boot                       Audit that every member disk can boot
+  stats-reset                Zero the per-device error counters
+
+Topics:
+  devices                    Naming drives: by-id paths, devids, dead drives
+  sudo                       Privileges, binary paths, unattended runs
+
+Run 'btrkeeper help <command|topic>' for detail, e.g. 'btrkeeper help upgrade'.
+Destructive commands confirm first; the prompt reads one key, defaulting to no.
+EOF
+}
+
+cmd_help() {
+    case "${1:-}" in
+    ""|help) help_root ;;
+
+    status) cat <<'EOF'
+btrkeeper status - filesystem layout, usage, and error counters
+
+Usage: btrkeeper [-m PATH] status
+
+Runs 'btrfs filesystem show', 'btrfs filesystem usage' and 'btrfs device
+stats' against the target filesystem.
+
+  * The devid column is what 'remove' and 'replace' accept in place of a
+    device path, which is how you name a drive that has disappeared.
+    See 'btrkeeper help devices'.
+  * 'filesystem usage' is the one that answers "why is it full" - it
+    separates allocated from used, which df cannot show you.
+  * Error counters are cumulative since the last 'stats-reset', not since
+    boot, so a non-zero value may be years old. Check 'health' and the
+    kernel log before concluding a disk is dying.
+
+Colour, on by default when writing to a terminal. Two of these numbers grade
+in opposite directions, so they are described apart.
+
+Allocation pressure - 'Device allocated' against 'Device size', plus the
+unallocated headroom left to carve new chunks from. High allocation is the
+bad end, and the computed percentage is printed alongside:
+
+    green    under 70% allocated  / over 30% headroom
+    yellow   70-85%               / 15-30%
+    orange   85-95%               / 5-15%
+    red      over 95% allocated   / under 5% headroom
+
+Chunk packing - the (NN.NN%) on a Data or Metadata line. That is Used/Size
+*within chunks already allocated*, not how full the filesystem is, so LOW is
+the bad end: it means allocation is spread across half-empty chunks. A dense
+97% there is healthy, not alarming.
+
+    green    75% and up, well packed
+    yellow   50-75%
+    orange   under 50% - exactly what 'balance quick' compacts, so the line
+             is flagged inline with a hint
+
+System and GlobalReserve chunks are tiny and always look sparse, so their
+percentages are left ungraded.
+
+Everything else:
+
+    green    zero error counters, RAID1 profiles, no missing devices
+    yellow   labels and totals, GlobalReserve (always single, not a fault)
+    orange   an unmirrored profile (single or DUP), multiple profiles present
+    red      a non-zero error counter, a missing device, RAID0
+
+Turn it off with --raw (or --no-color), or NO_COLOR=1 in the environment. It
+also switches itself off when output is not a terminal, so piping to a file
+or to grep gives you plain text without asking.
+EOF
+        ;;
+
+    health) cat <<'EOF'
+btrkeeper health - SMART wear and error indicators per member disk
+
+Usage: btrkeeper [-m PATH] health
+
+For each member: the SMART overall-health verdict, the attributes worth
+watching, and then the btrfs per-device error counters.
+
+  * Members are mapped to their parent disk first, so SMART is read from the
+    whole drive whether the filesystem sits on disks or on partitions.
+  * The attribute filter covers NVMe wear (percentage used, available spare,
+    media and data integrity errors) and the SATA attributes that actually
+    predict failure (reallocated, current pending, offline uncorrectable,
+    UDMA CRC), plus temperature and power-on hours.
+  * A member whose drive is missing or unreadable is skipped rather than
+    aborting the run, so this still works on a degraded array.
+  * A PASSED verdict means little on its own; the wear and reallocation
+    counts are the useful signal.
+  * Drives behind a USB bridge may need a '-d sat' that this does not pass.
+
+Colour, on by default when writing to a terminal. The graded number is the
+raw value on SATA rows and the value after the colon on NVMe lines:
+
+    green    healthy: PASSED, zero error counters, no reallocated or pending
+             sectors, wear under 70%, spare over 50%, under 50 C
+    yellow   informational: power-on hours, spare threshold, non-zero error
+             log entries, wear 70-85%, spare 20-50%, 50-60 C
+    orange   warning: CRC errors (usually a cable, not the drive), wear
+             85-95%, spare 10-20%, 60-70 C, no SMART data at all
+    red      bad: FAILED, an attribute marked failing, any reallocated,
+             pending or offline-uncorrectable sector, any media and data
+             integrity error, wear over 95%, spare under 10%, 70 C or more
+
+Same flags as elsewhere: --raw, --no-color, or NO_COLOR=1.
+EOF
+        ;;
+
+    scrub) cat <<'EOF'
+btrkeeper scrub - verify checksums, repair from the good mirror
+
+Usage: btrkeeper [-m PATH] scrub [start|run|status|cancel]
+
+Defaults to 'status' when given no action.
+
+  * 'start' returns immediately and the scrub runs in the kernel. Poll it
+    with 'btrkeeper scrub status'.
+  * 'run' blocks until the scrub finishes and exits non-zero if it found
+    errors. This is the one to use from a systemd timer or a cron job:
+    'start' would report success the instant it returned, whatever the
+    scrub went on to discover.
+  * A scrub reads every allocated block, checks it against its checksum, and
+    rewrites any bad copy from the other mirror. This is the only thing that
+    finds rot in data you are not actively reading.
+  * Errors reported as uncorrectable mean both copies are bad: that is real
+    data loss, and the status output names the affected files.
+  * 'cancel' stops it; a cancelled scrub starts over from the beginning.
+  * Worth running on a schedule (monthly is typical), after any 'replace',
+    and after an unclean shutdown. For unattended runs see 'help sudo'.
+EOF
+        ;;
+
+    balance) cat <<'EOF'
+btrkeeper balance - rewrite chunks to reclaim or redistribute allocation
+
+Usage: btrkeeper [-m PATH] balance [full|quick|status|cancel]
+
+Defaults to 'status' when given no action.
+
+  * 'quick' passes -dusage=50 -musage=50, so only chunks less than half full
+    are rewritten. This is the one to reach for when btrfs reports no space
+    while 'status' still shows free capacity - allocation has fragmented
+    into partly-used chunks and needs compacting.
+  * 'full' rewrites every chunk and can take many hours for little gain.
+  * Both return immediately; poll with 'btrkeeper balance status'. 'cancel'
+    stops one and keeps the progress already made.
+  * Balance is not routine maintenance. Run it when allocation is actually
+    skewed, not on a timer. Note that 'convert' is itself a balance, so the
+    two cannot run at once.
+EOF
+        ;;
+
+    convert) cat <<'EOF'
+btrkeeper convert - convert data and metadata profiles
+
+Usage: btrkeeper [-m PATH] [-y] convert [raid1|single]
+
+Defaults to 'raid1' when given no target.
+
+raid1 - balance with -dconvert=raid1 -mconvert=raid1
+
+  * Requires at least 2 devices and refuses to run otherwise; add one with
+    'btrkeeper add' first.
+  * This is the step that turns an added drive into an actual mirror. 'add'
+    on its own only extends capacity - the new space stays single-profile
+    and unmirrored until you convert.
+  * Also what you run after booting a degraded array: writes made while a
+    device was missing land in unmirrored single chunks, and this rewrites
+    them back to RAID1.
+
+single - balance with -dconvert=single -mconvert=dup
+
+  * Deliberately removes redundancy, and is the only command here that does.
+    Data drops to one copy, so a bad sector becomes data loss. Metadata goes
+    to DUP rather than single: still two copies, but both on one device.
+  * Exists because RAID1 chunks require two devices, so the array will not
+    release one until nothing depends on the second. This is the step before
+    'btrkeeper remove' when you are freeing a disk.
+  * Scrub before running it. You are about to depend on copies you have not
+    verified, for however long the rest of the work takes.
+
+Both rewrite every chunk, so expect hours on a full filesystem. Both return
+immediately; poll with 'btrkeeper balance status'.
+EOF
+        ;;
+
+    add) cat <<'EOF'
+btrkeeper add - wipe a drive and add it to the pool
+
+Usage: btrkeeper [-m PATH] [-y] add <dev>
+
+  * <dev> may be a kernel name or a /dev/disk/by-id/... path; see
+    'btrkeeper help devices'.
+  * Refuses a device that is mounted (itself or any of its partitions),
+    claimed by md/LUKS/LVM, or already a member of this filesystem.
+  * Everything that gets past those checks WILL be wiped. The prompt shows
+    the device and the signatures currently on it - read it.
+  * This is the only command that calls wipefs, so if you followed the
+    sudoers example in 'btrkeeper help sudo' it will ask for your password
+    after the confirmation. That is deliberate: routine work runs unprompted
+    and the one command that destroys a drive does not.
+  * Adding only extends capacity. Run 'btrkeeper convert' afterwards if this
+    drive is meant to be a RAID1 mirror.
+  * If the array is your root filesystem, add a *partition* on a drive you
+    have already given an ESP, not the whole disk - otherwise the mirror
+    holds your data but cannot boot it, and there is no room to fix that
+    later without rebuilding. btrkeeper warns when it sees this happening.
+    See 'btrkeeper help boot'.
+EOF
+        ;;
+
+    remove) cat <<'EOF'
+btrkeeper remove - migrate data off a drive and detach it
+
+Usage: btrkeeper [-m PATH] [-y] remove <dev|devid>
+
+  * Accepts a devid as well as a path, so a drive that has already vanished
+    can still be detached. See 'btrkeeper help devices'.
+  * Every block on the device is migrated to the remaining members first, so
+    this needs free space elsewhere and blocks until it finishes.
+  * Removing one half of a two-device RAID1 leaves the profile unsatisfiable.
+    If you are swapping hardware rather than shrinking the array, use
+    'btrkeeper replace' - it is faster and never drops redundancy.
+EOF
+        ;;
+
+    replace) cat <<'EOF'
+btrkeeper replace - swap one member for a new drive
+
+Usage: btrkeeper [-m PATH] [-y] replace <old|devid> <new>
+
+Runs 'btrfs replace start -B -f', then grows the new device to its full size.
+
+  * <old> may be a path or a devid. The devid form is how you replace a drive
+    that is no longer present - find it with 'btrkeeper status'. Replacing a
+    missing device needs the filesystem mounted -o degraded.
+  * <new> must be at least as large as the member it replaces. That is
+    checked before anything is wiped; equal-sized is fine.
+  * <new> faces the same guards as 'add': not mounted, not claimed by
+    md/LUKS/LVM, not already a member. It WILL be wiped.
+  * -B means this blocks until the copy finishes, so there is no progress to
+    poll. The copy reads from the surviving mirror, so the filesystem stays
+    online and usable throughout.
+  * The new device inherits the old devid, which is why the resize that
+    follows can address it as <devid>:max.
+  * Run 'btrkeeper scrub start' afterwards to verify the rebuilt mirror.
+EOF
+        ;;
+
+    upgrade) cat <<'EOF'
+btrkeeper upgrade - swap both members for bigger drives
+
+Usage: btrkeeper [-m PATH] [-y] upgrade <new1> <new2>
+
+Replaces each member in turn, resizing after each, with a verification scrub
+in between:
+
+    1. member 1 -> new1    live replace + resize
+    2. scrub               blocks; proves the new mirror
+    3. member 2 -> new2    live replace + resize
+    4. final scrub         backgrounded
+
+  * Requires exactly two members, two distinct new drives, each at least as
+    large as the member it replaces. All of that is checked up front, before
+    anything is wiped, and the plan prints old and new sizes.
+  * Step 2 is the point of this command and is not optional. Replacing both
+    members back to back leaves a window where a latent bad block on the
+    second original is the only copy of some data. If that scrub reports
+    errors the upgrade stops there, with your second original still intact.
+  * Expect hours. Steps 1-3 block; the final scrub runs in the background,
+    so poll it with 'btrkeeper scrub status'.
+  * The filesystem stays online and usable the whole time.
+  * To grow onto one bigger drive at a time instead, use 'replace' twice and
+    scrub yourself in between - this command is that, with the scrub made
+    mandatory.
+EOF
+        ;;
+
+    stats-reset) cat <<'EOF'
+btrkeeper stats-reset - zero the per-device error counters
+
+Usage: btrkeeper [-m PATH] [-y] stats-reset
+
+  * Counters are cumulative since the last reset, not since boot, so a
+    non-zero value may be years old. Note what they were before zeroing.
+  * Zero them only once you know why they went up - after replacing the
+    drive, or after confirming the cause was a cable or a controller.
+    Resetting to make a warning go away discards the only record you have.
+  * Read them with 'btrkeeper status' or 'btrkeeper health'.
+EOF
+        ;;
+
+    devices) cat <<'EOF'
+btrkeeper - naming drives
+
+Device arguments accept:
+
+    /dev/sdX, /dev/nvme0n1p2     kernel names
+    /dev/disk/by-id/...          stable names; symlinks are resolved before
+                                 anything is matched against the array
+    <devid>                      'remove' and 'replace' only
+
+Kernel names are not stable across reboots or controller changes. by-id
+paths are, which matters when the next thing that happens is a wipe.
+
+Devids come from 'btrkeeper status'. They are how you name a drive that is
+no longer present: a dead drive has no /dev node, so there is no path to
+pass. Replacing a missing device needs the filesystem mounted -o degraded.
+
+Before wiping anything, 'add', 'replace' and 'upgrade' refuse a device that
+is mounted (itself or any of its partitions), claimed by md/LUKS/LVM, or
+already a member of the target filesystem. 'replace' and 'upgrade' also
+refuse a drive smaller than the member it has to hold.
+EOF
+        ;;
+
+    boot) cat <<'EOF'
+btrkeeper boot - audit that every member disk can boot the system
+
+Usage: btrkeeper [-m PATH] boot
+
+Read-only. It never writes a partition table, an ESP or a firmware variable:
+none of those are btrfs operations, and getting them wrong costs you a boot.
+
+What it checks:
+
+  1. Every member disk carries an EFI System Partition. A disk without one
+     holds your data but cannot start the machine.
+  2. Each ESP is named by a firmware boot entry, and that entry appears in
+     BootOrder. Matching is done on partition GUID, not bootnum: some
+     firmwares renumber their BBS entries on every boot, so a check pinned
+     to bootnums would report drift that is not real.
+  3. The ESPs have not drifted apart. Run as root it compares contents; run
+     unprivileged it can only compare sizes, and says so.
+
+Exit status is 1 if any member disk cannot boot, 0 otherwise. Warnings do
+not fail the run.
+
+  * The stale mirror ESP is the failure this exists to catch. Nothing looks
+    wrong until the live ESP is gone and the copy turns out to be a year
+    behind. Worth running after kernel updates, and on a timer.
+  * It does not check for a degraded-capable boot entry, which is
+    bootloader-specific. See the note at the end of this page.
+
+--------------------------------------------------------------------------
+
+btrfs RAID1 mirrors the filesystem. It does not mirror the boot path. If the
+array is your root filesystem, losing the disk that holds the EFI System
+Partition leaves your data intact and the machine unbootable until you build
+an ESP somewhere else.
+
+A bootable mirror needs, on each disk:
+
+    1. an EFI System Partition of its own
+    2. the bootloader installed into that ESP
+    3. a firmware boot entry pointing at it (efibootmgr)
+    4. a way to keep the two ESPs in step as kernels are updated
+
+btrkeeper does none of that. Partitioning, bootloaders and firmware entries
+are outside what a btrfs tool should reach into. What it does do is warn you
+before a drive is consumed in a way that forecloses the option.
+
+Getting it right up front:
+
+    Partition the new drive first - an ESP (1-4 GiB, type EF00, vfat) plus a
+    btrfs partition using the rest - then hand over the btrfs partition:
+
+        btrkeeper add /dev/nvme1n1p2     not     btrkeeper add /dev/nvme1n1
+
+    Adding a whole disk leaves no room for an ESP later without rebuilding.
+
+Fixing a whole-disk member after the fact:
+
+    There is no safe in-place way to carve an ESP out of a disk that is
+    already a whole-disk btrfs member. The array has to give the disk back:
+
+        btrfs balance start -dconvert=single -mconvert=dup /
+        btrkeeper remove /dev/nvme1n1
+        # partition nvme1n1: ESP + btrfs
+        btrkeeper add /dev/nvme1n1p2
+        btrkeeper convert
+
+    The first step needs all the data to fit on the remaining member. That
+    is two full balances and likely hours of rewriting, online throughout.
+    Weigh it against keeping a rescue USB instead: the data is redundant
+    either way, and what the rebuild buys you is booting without one.
+
+Keeping the ESPs in step:
+
+    The second ESP goes stale the moment a kernel update writes to the
+    first. Either mount both and have the bootloader install to each, or
+    sync one onto the other from a package-manager hook. An ESP a year out
+    of date may not boot the kernel that is actually on disk. 'btrkeeper
+    boot' checks for exactly this.
+
+Booting a degraded array:
+
+    Two ESPs are not enough on their own. btrfs refuses to mount a degraded
+    RAID1 root unless the kernel command line carries 'degraded', so a disk
+    failure otherwise drops you to an emergency shell with a perfectly good
+    bootloader. Add a second boot entry with rootflags=degraded and leave
+    the default entry strict, so a failure is loud rather than silent.
+
+    That entry is bootloader-specific, so 'btrkeeper boot' does not check
+    for it. Verify it yourself, once, and test it by actually removing a
+    drive. Anything written while degraded lands in unmirrored single
+    chunks - run 'btrkeeper convert' afterwards.
+EOF
+        ;;
+
+    sudo) cat <<'EOF'
+btrkeeper - privileges and unattended runs
+
+btrkeeper runs unprivileged. It calls btrfs, smartctl and wipefs through
+sudo at absolute paths, so only those three binaries need rights.
+
+Paths are probed in /usr/bin, /usr/sbin, /sbin, /bin. Override individually
+with BTRKEEPER_BTRFS, BTRKEEPER_SMARTCTL, BTRKEEPER_WIPEFS. Whatever ends up
+being used has to match your sudoers rule exactly.
+
+To avoid a password prompt per call, add a rule with
+'visudo -f /etc/sudoers.d/btrkeeper':
+
+    %wheel ALL=(root) NOPASSWD: /usr/bin/btrfs, /usr/bin/smartctl
+
+wipefs is deliberately absent. It is the one binary here that destroys data
+outright, and 'add' is the only command that calls it - so leaving it out
+means routine work runs unprompted while the command that wipes a drive
+still asks. Whether to grant it is a decision for whoever runs this, not
+something this tool should recommend.
+
+Even as written the rule is substantial: passwordless btrfs can remove
+devices and start balances. Scope it to one user rather than a group if that
+matters to you, and drop NOPASSWD entirely if you would rather be asked
+every time.
+
+For cron or systemd timers you also need -y. Confirmation prompts read the
+terminal directly and fail closed when there is not one, so an unattended
+run without -y aborts rather than proceeding:
+
+    btrkeeper -y scrub start
+EOF
+        ;;
+
+    *) die "no help for '$1' (try: btrkeeper help)" ;;
+    esac
+}
+
+main() {
+    local -a rest
+    rest=()
+    while (( $# )); do
+        case "$1" in
+            -m|--mount)
+                [[ -n "${2:-}" ]] || die "--mount requires a path"
+                MOUNT="$2"
+                shift 2
+                ;;
+            --mount=*)  MOUNT="${1#--mount=}"; shift ;;
+            -y|--yes)   ASSUME_YES=1; shift ;;
+            --raw|--no-color) USE_COLOR=0; shift ;;
+            -h|--help)  WANT_HELP=1; shift ;;
+            --)         shift; rest+=("$@"); break ;;
+            -*)         die "unknown option '$1' (try: btrkeeper help)" ;;
+            *)          rest+=("$1"); shift ;;
+        esac
+    done
+
+    setup_colors
+    local cmd="${rest[1]:-help}"
+    (( ${#rest} )) && shift rest
+    if (( WANT_HELP )); then
+        cmd_help "$cmd"
+        return 0
+    fi
+    case "$cmd" in
+        status)      cmd_status ;;
+        health)      cmd_health ;;
+        scrub)       cmd_scrub "${rest[@]}" ;;
+        balance)     cmd_balance "${rest[@]}" ;;
+        convert)     cmd_convert "${rest[@]}" ;;
+        add)         cmd_add "${rest[@]}" ;;
+        remove)      cmd_remove "${rest[@]}" ;;
+        replace)     cmd_replace "${rest[@]}" ;;
+        upgrade)     cmd_upgrade "${rest[@]}" ;;
+        boot)        cmd_boot ;;
+        stats-reset) cmd_stats_reset ;;
+        help)        cmd_help "${rest[@]}" ;;
+        *)           die "unknown command '$cmd' (try: btrkeeper help)" ;;
+    esac
+}
+
+main "$@"

@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# 96-esp2-sync - keep the mirror ESP in step with the live one.
+#
+# The bootloader tooling only ever writes to the ESP it manages (ESP_PATH in
+# /etc/default/limine). A second ESP on the other disk exists so the machine
+# can still boot when the first disk is gone - but it is only worth as much
+# as it is current. An ESP months behind may not boot the kernel that is
+# actually on disk, which is precisely the failure you would discover at the
+# worst possible moment.
+#
+# Runs from /etc/boot/hooks/post.d as root, after the live ESP is updated.
+# Exit codes under 100 are warnings to the hook runner, so a failed sync
+# never blocks a kernel install.
+
+set -uo pipefail
+
+readonly SCRIPT_NAME="esp2-sync"
+readonly SRC=/boot
+readonly DEST=/boot2
+
+warn() { printf '\033[93m%s: %s\033[0m\n' "$SCRIPT_NAME" "$*" >&2; }
+info() { printf '%s: %s\n' "$SCRIPT_NAME" "$*"; }
+
+# Parent disk backing a path, so the two ESPs can be told apart.
+disk_of() {
+    local src part
+    src="$(findmnt -no SOURCE --target "$1" 2>/dev/null)" || return 0
+    part="$(lsblk -no PKNAME -- "$src" 2>/dev/null | head -1)" || return 0
+    printf '%s' "${part//[[:space:]]/}"
+}
+
+((EUID == 0))        || { warn "must run as root";              exit 1; }
+mountpoint -q "$SRC" || { warn "$SRC is not mounted; skipping"; exit 1; }
+[[ -d $DEST ]]       || { warn "$DEST does not exist; skipping"; exit 1; }
+
+# /boot2 is mounted nofail, so it may legitimately be absent. Mount it for
+# the duration and put it back the way it was found.
+mounted_here=0
+if ! mountpoint -q "$DEST"; then
+    if ! mount "$DEST" 2>/dev/null; then
+        warn "$DEST is not mounted and could not be mounted; skipping"
+        exit 1
+    fi
+    mounted_here=1
+fi
+
+# Without this, a sync into an unmounted mountpoint would quietly fill the
+# root filesystem with a copy that can never be booted from.
+if ! mountpoint -q "$DEST"; then
+    warn "$DEST is still not a mountpoint; refusing"
+    exit 1
+fi
+
+if [[ "$(stat -c %d "$SRC")" == "$(stat -c %d "$DEST")" ]]; then
+    warn "$DEST is the same filesystem as $SRC; refusing"
+    ((mounted_here)) && umount "$DEST"
+    exit 1
+fi
+
+# A mirror ESP on the same physical disk protects against nothing. Worth
+# saying out loud, but not worth refusing over.
+src_disk="$(disk_of "$SRC")"
+dest_disk="$(disk_of "$DEST")"
+if [[ -n $src_disk && -n $dest_disk && $src_disk == "$dest_disk" ]]; then
+    warn "$DEST is on the same disk ($src_disk) as $SRC - this protects nothing"
+fi
+
+# No exclusions: an exact mirror keeps 'diff -rq /boot /boot2' meaningful as
+# a verification, which is the only cheap way to know this is still working.
+rc=0
+if ! rsync -a --delete "$SRC/" "$DEST/"; then
+    warn "rsync failed; $DEST may be inconsistent"
+    rc=1
+fi
+
+sync
+((mounted_here)) && umount "$DEST"
+((rc == 0)) && info "$DEST synced from $SRC"
+exit "$rc"
