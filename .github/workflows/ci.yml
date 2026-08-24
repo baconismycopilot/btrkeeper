@@ -20,9 +20,11 @@ jobs:
       - uses: actions/checkout@v4
       # Runners do not ship zsh, and `zsh -n` is most of what lint does.
       - run: sudo apt-get update && sudo apt-get install -y zsh
-      # systemd-analyze warns that /usr/local/bin/btrkeeper is absent here --
-      # it is not installed in CI -- but still exits 0, so the units are
-      # genuinely verified.
+      # The units name /usr/local/bin/btrkeeper in ExecStart, and newer
+      # systemd fails verification outright when that path does not exist
+      # (older versions only warn). Installing first makes the check mean
+      # what it should: that the units point at something real.
+      - run: sudo make install-system
       - run: make lint
 
   test:
