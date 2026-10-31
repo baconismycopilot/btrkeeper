@@ -25,6 +25,7 @@ help:
 	@echo "  timers-status    when each timer next fires"
 	@echo "  logs             follow the timers' journal"
 	@echo ""
+	@echo "  doctor           report required tools, target and install state"
 	@echo "  status           filesystem layout, usage and error counters"
 	@echo "  audit            check every member disk can still boot"
 
@@ -102,6 +103,11 @@ logs:
 	journalctl -u btrkeeper-scrub.service -u btrkeeper-boot-audit.service -f
 
 # --- operating ---------------------------------------------------------
+
+# Reports, never asserts: a missing dependency is the output, not an abort.
+.PHONY: doctor
+doctor:
+	@./$(BIN) doctor
 
 .PHONY: status
 status:

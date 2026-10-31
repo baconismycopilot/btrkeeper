@@ -29,6 +29,21 @@ does not fix. That boundary is deliberate and has been raised and settled once a
 adjacent work (partitioning, Limine, `efibootmgr`, keeping a mirror ESP current) lives in
 `contrib/` and `docs/bootable-mirror-rebuild.md`, not in the script.
 
+## Dependencies
+
+Nothing installs them. `make install` copies one file; `btrfs-progs`,
+`smartmontools`, `util-linux` and `zsh` are the user's to provide. `resolve_bin`
+falls through to `/usr/bin/<name>` when it finds nothing, so without a check the
+failure surfaces as `sudo: /usr/bin/btrfs: command not found` several frames
+deep. `assert_tools` runs first instead — a core set from `main` for every
+command but `help` and `doctor`, plus `smartctl` in `health` and `wipefs` in
+`add` — and `btrkeeper doctor` reports the whole picture without asserting
+anything.
+
+The smoke suite stubs the three privileged binaries and points
+`BTRKEEPER_BTRFS`/`_SMARTCTL`/`_WIPEFS` at the stubs, so it stays runnable on a
+host with no filesystem toolchain rather than having CI apt-install one.
+
 ## Architecture
 
 ### The privilege seam

@@ -24,6 +24,10 @@ Make sure `~/.local/bin` is on your `PATH`.
 - `smartmontools` — `smartctl`
 - `util-linux` — `wipefs`, `lsblk`, `findmnt`
 
+Nothing installs these for you — `make install` copies a single file. Run
+`btrkeeper doctor` to see which are present, with paths and versions; every
+other command checks the ones it needs first and names what is missing.
+
 The three privileged binaries are looked up in `/usr/bin`, `/usr/sbin`,
 `/sbin`, and `/bin`, in that order. Override any of them with
 `BTRKEEPER_BTRFS`, `BTRKEEPER_SMARTCTL`, or `BTRKEEPER_WIPEFS` — whatever
@@ -123,6 +127,7 @@ give plain text. Force it off with `--raw` (or `--no-color`), or `NO_COLOR=1`.
 | `replace <old\|devid> <new>` | Swap one member for a new drive, then grow into its full size |
 | `upgrade <new1> <new2>` | Swap both members for bigger drives, scrubbing in between |
 | `boot` | Audit that every member disk can actually boot the system |
+| `doctor` | Report required tools, the target filesystem, privileges and install state |
 | `stats-reset` | Zero the per-device error counters |
 | `help` | Command summary |
 

@@ -76,6 +76,17 @@ exec $REAL_FINDMNT "\$@"
 MOCK
 chmod +x "$TMP/bin/findmnt"
 
+# assert_tools checks these exist before anything reaches sudo, and a runner
+# has no btrfs-progs. Stub them and point btrkeeper at the stubs, so the suite
+# stays self-contained instead of apt-installing a filesystem toolchain.
+for b in btrfs smartctl wipefs; do
+    printf '#!/bin/sh\necho "%s (stub)"\n' "$b" > "$TMP/bin/$b"
+    chmod +x "$TMP/bin/$b"
+done
+export BTRKEEPER_BTRFS="$TMP/bin/btrfs"
+export BTRKEEPER_SMARTCTL="$TMP/bin/smartctl"
+export BTRKEEPER_WIPEFS="$TMP/bin/wipefs"
+
 export PATH="$TMP/bin:$PATH"
 
 pass=0; fail=0
@@ -99,7 +110,8 @@ run() {  # run <expected-exit|any> <args...>
 echo "── commands ──"
 run 0 status
 run 0 health
-run any boot   # exit depends on the host's disks; we only assert it runs
+run any boot     # exit depends on the host's disks; we only assert it runs
+run any doctor   # likewise: reports the host, so the verdict is not fixed
 run 0 scrub status
 run 0 scrub start
 run 0 scrub run
@@ -130,7 +142,7 @@ run 0 --help
 echo "── help ──"
 run 0 help
 for t in status health scrub balance convert add remove replace upgrade boot \
-         stats-reset devices boot sudo; do
+         doctor stats-reset devices sudo; do
     run 0 help "$t"
 done
 run 1 help nonsense

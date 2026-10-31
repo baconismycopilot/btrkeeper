@@ -65,6 +65,25 @@ assert_btrfs() {
     [[ "$fstype" == btrfs ]] || die "$MOUNT is not on a mounted btrfs filesystem"
 }
 
+# Fail with a list of what is missing, rather than dying three frames deep
+# inside sudo with "command not found". An absolute path is tested with -x
+# because resolve_bin falls through to /usr/bin/<name> when it finds nothing;
+# a bare name goes through PATH.
+assert_tools() {
+    local t
+    local -a missing
+    missing=()
+    for t in "$@"; do
+        if [[ "$t" == */* ]]; then
+            [[ -x "$t" ]] || missing+=("$t")
+        else
+            command -v "$t" >/dev/null 2>&1 || missing+=("$t")
+        fi
+    done
+    (( ${#missing} )) || return 0
+    die "missing: ${missing[*]} (run 'btrkeeper doctor')"
+}
+
 # Resolve a device path through symlinks (/dev/disk/by-id/... -> /dev/sdX).
 # Missing paths are returned unchanged so callers can still report them.
 resolve_dev() {
@@ -594,6 +613,7 @@ cmd_status() {
 # predict failure.
 cmd_health() {
     assert_btrfs
+    assert_tools "$SMARTCTL_BIN"
     local dev disk attrs verdict
     # One pattern, no embedded newlines: grep would treat those as separate
     # patterns, and a trailing '|' as an empty alternative matching everything.
@@ -680,6 +700,7 @@ cmd_add() {
     assert_btrfs
     local dev="${1:-}" real
     [[ -n "$dev" ]] || die "add requires a block device path"
+    assert_tools "$WIPEFS_BIN"
     assert_free_device "$dev" add
     real="$(resolve_dev "$dev")"
 
@@ -911,6 +932,99 @@ cmd_boot() {
     return 0
 }
 
+# Report what the tool needs and what it found. Read-only, and deliberately
+# does not assert anything: a missing dependency or a non-btrfs target is the
+# output here, not a reason to abort.
+cmd_doctor() {
+    local t bin ver p mp fstype problems=0
+
+    section "Required tools"
+    for t in "$BTRFS_BIN" "$SMARTCTL_BIN" "$WIPEFS_BIN" lsblk findmnt df awk numfmt; do
+        if [[ "$t" == */* ]]; then
+            bin="$t"
+        else
+            bin="$(command -v "$t" 2>/dev/null)" || bin=""
+        fi
+        if [[ -n "$bin" && -x "$bin" ]]; then
+            ver="$("$bin" --version 2>/dev/null | head -1)" || ver=""
+            print -r -- "  ${C_GREEN}ok${C_RESET}   $bin${ver:+  ${C_DIM}${ver}${C_RESET}}"
+        else
+            problems=$(( problems + 1 ))
+            print -r -- "  ${C_RED}BAD${C_RESET}  ${C_RED}${t} not found${C_RESET}"
+        fi
+    done
+    print
+
+    section "Optional tools"
+    for t in efibootmgr rsync sgdisk sfdisk; do
+        bin="$(command -v "$t" 2>/dev/null)" || bin=""
+        if [[ -n "$bin" ]]; then
+            print -r -- "  ${C_GREEN}ok${C_RESET}   $bin"
+        else
+            print -r -- "  ${C_YELLOW}none${C_RESET} $t  ${C_DIM}(boot audit / contrib hooks / partitioning)${C_RESET}"
+        fi
+    done
+    print
+
+    section "Target filesystem"
+    fstype="$(findmnt -no FSTYPE --target "$MOUNT" 2>/dev/null | head -1)" || fstype=""
+    mp="$(findmnt -no TARGET --target "$MOUNT" 2>/dev/null | head -1)" || mp=""
+    if [[ "$fstype" == btrfs ]]; then
+        print -r -- "  ${C_GREEN}ok${C_RESET}   $MOUNT is btrfs (mounted at ${mp:-?})"
+    else
+        problems=$(( problems + 1 ))
+        print -r -- "  ${C_RED}BAD${C_RESET}  ${C_RED}$MOUNT is ${fstype:-not mounted}, not btrfs${C_RESET}"
+    fi
+    print
+
+    section "Privileges"
+    # -n never prompts, so this reports the sudoers state without blocking.
+    if command sudo -n "$BTRFS_BIN" --version >/dev/null 2>&1; then
+        print -r -- "  ${C_GREEN}ok${C_RESET}   passwordless sudo for $BTRFS_BIN"
+    else
+        print -r -- "  ${C_YELLOW}note${C_RESET} sudo will prompt for $BTRFS_BIN  ${C_DIM}(see 'btrkeeper help sudo')${C_RESET}"
+    fi
+    if command sudo -n "$WIPEFS_BIN" --version >/dev/null 2>&1; then
+        print -r -- "  ${C_YELLOW}note${C_RESET} passwordless sudo for $WIPEFS_BIN  ${C_DIM}(the documented example omits this)${C_RESET}"
+    else
+        print -r -- "  ${C_GREEN}ok${C_RESET}   $WIPEFS_BIN will prompt, so 'add' asks before it wipes"
+    fi
+    print
+
+    section "Installation"
+    for p in "$HOME/.local/bin/btrkeeper" /usr/local/bin/btrkeeper; do
+        if [[ -x "$p" ]]; then
+            print -r -- "  ${C_GREEN}ok${C_RESET}   $p"
+        else
+            print -r -- "  ${C_YELLOW}none${C_RESET} $p"
+        fi
+    done
+    for p in /etc/boot/hooks/post.d/95-esp-backup /etc/boot/hooks/post.d/96-esp2-sync; do
+        if [[ -x "$p" ]]; then
+            print -r -- "  ${C_GREEN}ok${C_RESET}   $p"
+        else
+            print -r -- "  ${C_YELLOW}none${C_RESET} $p"
+        fi
+    done
+    for t in btrkeeper-scrub.timer btrkeeper-boot-audit.timer; do
+        ver="$(systemctl is-enabled "$t" 2>/dev/null)" || ver="not installed"
+        if [[ "$ver" == enabled ]]; then
+            print -r -- "  ${C_GREEN}ok${C_RESET}   $t enabled"
+        else
+            print -r -- "  ${C_YELLOW}none${C_RESET} $t ($ver)"
+        fi
+    done
+    print
+
+    section "Summary"
+    if (( problems > 0 )); then
+        print -r -- "  ${C_RED}$problems problem(s): btrkeeper will not work as-is${C_RESET}"
+        return 1
+    fi
+    print -r -- "  ${C_GREEN}everything btrkeeper requires is present${C_RESET}"
+    return 0
+}
+
 # Reset per-device error counters after investigating them.
 cmd_stats_reset() {
     assert_btrfs
@@ -945,6 +1059,7 @@ Commands:
   replace <old|devid> <new>  Swap one member for a new drive, resize to max
   upgrade <new1> <new2>      Swap both members for bigger drives
   boot                       Audit that every member disk can boot
+  doctor                     Report required tools, target and install state
   stats-reset                Zero the per-device error counters
 
 Topics:
@@ -1236,6 +1351,35 @@ Usage: btrkeeper [-m PATH] [-y] stats-reset
 EOF
         ;;
 
+    doctor) cat <<'EOF'
+btrkeeper doctor - report what is required and what is present
+
+Usage: btrkeeper [-m PATH] doctor
+
+Read-only, and it asserts nothing: a missing dependency or a target that is
+not btrfs is the output here, not a reason to abort. Exit status is 1 when
+something required is absent.
+
+What it reports:
+
+  required tools   btrfs, smartctl, wipefs and the lsblk/findmnt/df/awk/numfmt
+                   this leans on, with the path and version of each
+  optional tools   efibootmgr (boot audit), rsync (contrib hooks), sgdisk and
+                   sfdisk (partitioning) - absent is a note, not a fault
+  target           whether -m/$BTRKEEPER_MOUNT is actually on btrfs
+  privileges       whether sudo will prompt, tested with -n so it never does.
+                   A passwordless wipefs is flagged, since the documented
+                   sudoers example deliberately omits it
+  installation     both install paths, the contrib hooks, and the timers
+
+  * Nothing installs dependencies. 'make install' copies one file; the tools
+    above are the user's to provide. This command is how you find out which
+    are missing, instead of discovering it inside a failing sudo call.
+  * Every other command runs a smaller version of the same check first and
+    dies naming what is absent.
+EOF
+        ;;
+
     devices) cat <<'EOF'
 btrkeeper - naming drives
 
@@ -1419,6 +1563,13 @@ main() {
         cmd_help "$cmd"
         return 0
     fi
+    # Everything but help and doctor needs btrfs on disk; checking once here
+    # beats each command discovering it inside a sudo call.
+    case "$cmd" in
+        help|doctor) ;;
+        *)           assert_tools "$BTRFS_BIN" lsblk findmnt awk ;;
+    esac
+
     case "$cmd" in
         status)      cmd_status ;;
         health)      cmd_health ;;
@@ -1430,6 +1581,7 @@ main() {
         replace)     cmd_replace "${rest[@]}" ;;
         upgrade)     cmd_upgrade "${rest[@]}" ;;
         boot)        cmd_boot ;;
+        doctor)      cmd_doctor ;;
         stats-reset) cmd_stats_reset ;;
         help)        cmd_help "${rest[@]}" ;;
         *)           die "unknown command '$cmd' (try: btrkeeper help)" ;;
